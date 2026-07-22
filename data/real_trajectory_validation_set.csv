@@ -1,0 +1,5 @@
+student_id,word_id,attempt_number,phase1_exposure_ratio,speech_score,phoneme_accuracy,phoneme_error_class,response_latency_ms_phase2,echolalia_flag,response_latency_ms_phase3,first_tap_correct,selection_change_count,prompt_count,difficulty,category,label,synthetic
+22,15,1,,3,,,,False,8899.0,False,2,1,1,abilities,fast,False
+29,15,1,,1,,,1504.0,False,11716.0,True,0,1,1,abilities,struggling,False
+28,16,1,,1,,,3159.0,False,12958.0,True,0,1,1,abilities,struggling,False
+29,17,1,,1,,,3917.0,False,11753.0,False,0,1,1,abilities,struggling,False
