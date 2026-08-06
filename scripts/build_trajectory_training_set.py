@@ -29,17 +29,24 @@ Flagging each one explicitly rather than silently picking a default:
    was ever captured for them. That's a genuine gap in what was recorded,
    not a bug in this script, so those rows can't be validated against the
    full feature schema and are dropped rather than backfilled with fake zeros.
-5. `phase1_exposure_ratio` is reported as NULL (unrecoverable), not computed.
-   dialogue_word_progress.phase1_exposure_count/phase1_required_exposures are
-   LIVE counters that dialogueService.js's recordPhase3Result resets to 0 after
-   every completed session ("Reset phase to 1 for next session"). By the time a
-   word has resolved to mastered/struggling, they no longer reflect the baseline
-   exposure ratio at all — every resolved row's live phase1_exposure_count was
-   confirmed to be 0 against real pilot data (2026-07-21), which would produce a
-   near-constant, uninformative 0.0 rather than real signal. There is no
-   historical/point-in-time exposure log to recover the true baseline from, so
-   this column is left NULL rather than filled with a number that looks real
-   but isn't.
+5. `phase1_exposure_ratio` is read from
+   dialogue_word_progress.phase1_exposure_ratio_snapshot (TASK-25,
+   FSD-EXPOSURE-SNAPSHOT-001) when present — a point-in-time value
+   dialogueService.js writes exactly once, at a word's first-ever Phase 1
+   gate pass, before recordPhase3Result's post-session reset can touch it.
+   Any row whose snapshot predates this migration (or whose word resolved
+   before the write path existed) has `phase1_exposure_ratio_snapshot IS
+   NULL` in the database, and this script reports it as NULL here too — R-24
+   still stands for all pre-migration data; nothing is backfilled or
+   computed from the live (post-reset) counters.
+   Category 3 (abilities) is a DIFFERENT case, per R-32: it has no Phase 1
+   exposure concept at all (`ActionWordAttempt.js` has no `phase1_*` fields),
+   so `phase1_exposure_ratio` is structurally N/A there, not merely missing.
+   Abilities rows get a fixed sentinel of -1.0 (outside the metric's valid
+   0.0-1.0+ range) instead of NULL, kept visibly distinct from genuine
+   pre-migration missingness in greetings/magic_words rows — a non-abilities
+   row with an unexplained null triggers a visible warning rather than being
+   silently folded into the same sentinel bucket.
 
 Usage:
     python build_trajectory_training_set.py [--since YYYY-MM-DD] [--out PATH]
@@ -59,12 +66,10 @@ REQUIRED_ENV = ['DB_HOST', 'DB_PORT', 'DB_NAME', 'DB_USER', 'DB_PASSWORD']
 TRAJECTORY_CATEGORIES = ('greetings', 'magic_words', 'abilities')  # Hard Rule 4
 
 # PROPOSED_MASTERED_SPLIT: a 'mastered' word is called 'fast' if it took the
-# minimum possible route to mastery (Rule 1 = 2 passes on different days) with
-# no recorded struggle along the way; otherwise 'typical'. This threshold is a
-# default proposal, not a confirmed decision — adjust here if the real
-# definition of "fast" should differ.
+# minimum possible route to mastery (Rule 1 = 2 passes on different days);
+# otherwise 'typical'. This threshold is a default proposal, not a confirmed
+# decision — adjust here if the real definition of "fast" should differ.
 FAST_MAX_TOTAL_SESSIONS = 2
-FAST_MAX_CONSECUTIVE_FAILS_EVER = 0
 
 
 def get_engine():
@@ -90,6 +95,7 @@ SELECT
   wp.status,
   wp.phase1_exposure_count,
   wp.phase1_required_exposures,
+  wp.phase1_exposure_ratio_snapshot,
   wp.total_sessions,
   wp.consecutive_fail_count,
   wp.echolalia_rate
@@ -103,7 +109,7 @@ WHERE dw.category IN :categories
 PHASE2_QUERY = """
 SELECT DISTINCT ON (student_id, word_id)
   student_id, word_id, speech_score, phoneme_accuracy, phoneme_error_class,
-  echolalia_flag, response_latency_ms AS response_latency_ms_phase2
+  echolalia_flag, response_latency_ms AS response_latency_ms_phase2, match_type
 FROM dialogue_word_attempts
 WHERE phase = 2
   AND attempted_at >= :since
@@ -136,7 +142,8 @@ SELECT DISTINCT ON (student_id, word_id)
   phase2_phoneme_accuracy AS phoneme_accuracy,
   phase2_phoneme_error_class AS phoneme_error_class,
   phase2_echolalia_flag AS echolalia_flag,
-  phase2_response_latency_ms AS response_latency_ms_phase2
+  phase2_response_latency_ms AS response_latency_ms_phase2,
+  phase2_match_type AS match_type
 FROM action_word_attempts
 WHERE attempted_at >= :since
   AND phase2_speech_score IS NOT NULL
@@ -161,11 +168,15 @@ ORDER BY dp.student_id, dp.word_id, dp.attempted_at ASC;
 def derive_label(row) -> str:
     if row['status'] == 'struggling':
         return 'struggling'
-    # status == 'mastered' here (progress query already filters to mastered/struggling)
-    is_fast = (
-        row['total_sessions'] <= FAST_MAX_TOTAL_SESSIONS
-        and row['consecutive_fail_count'] <= FAST_MAX_CONSECUTIVE_FAILS_EVER
-    )
+    # status == 'mastered' here (progress query already filters to
+    # mastered/struggling). is_fast = mastered in the minimum possible
+    # number of sessions (Rule 1 = 2 passes). No separate "consecutive
+    # fails" check is needed: session_pass_count can never exceed
+    # total_sessions, and mastery requires session_pass_count >= 2, so
+    # total_sessions <= 2 already forces both sessions to have been
+    # passes on its own — confirmed redundant 2026-08-06, not merely
+    # broken by TASK-34's fix.
+    is_fast = row['total_sessions'] <= FAST_MAX_TOTAL_SESSIONS
     return 'fast' if is_fast else 'typical'
 
 
@@ -210,10 +221,24 @@ def build_dataset(since: str) -> pd.DataFrame:
         print( '        session-summary Phase 3 record exists (scenario_label IS NULL), so no real')
         print( '        per-scenario telemetry was ever captured. Genuine data gap, not backfilled with defaults.')
 
-    # See docstring item 5: this is a live, post-session-reset counter by the time a
-    # word resolves — not a recoverable baseline exposure ratio. Reported as NULL,
-    # not computed, so it isn't mistaken for real signal.
-    df['phase1_exposure_ratio'] = pd.NA
+    # See docstring item 5: real baseline when a post-migration snapshot exists,
+    # NULL otherwise (pre-migration rows, or words resolved before the snapshot
+    # write path existed) — never computed from the live post-reset counters.
+    df['phase1_exposure_ratio'] = df['phase1_exposure_ratio_snapshot']
+
+    # R-32: abilities has no Phase 1 exposure concept at all (structurally N/A,
+    # not missing) — fixed sentinel, kept distinct from genuine pre-migration
+    # nulls in greetings/magic_words (see docstring item 5).
+    df.loc[df['category'] == 'abilities', 'phase1_exposure_ratio'] = -1.0
+    still_null = df[(df['category'] != 'abilities') & (df['phase1_exposure_ratio'].isna())]
+    if not still_null.empty:
+        print(f'WARNING: {len(still_null)} non-abilities row(s) have genuinely '
+              f'missing phase1_exposure_ratio (pre-migration) — see R-24/DEC-06.')
+
+    # verbal_path: session-1 Phase 2 baseline attempt's own match_type (same row
+    # attempt_number=1 already selects) — True unless that attempt was the
+    # non-verbal fallback. Additive feature, FSD-MASTERY-PATH-001.
+    df['verbal_path'] = df['match_type'] != 'non_verbal'
 
     df['attempt_number'] = 1  # baseline snapshot, matches the synthetic schema's constant column
     df['label'] = df.apply(derive_label, axis=1)
@@ -227,7 +252,7 @@ OUTPUT_COLUMNS = [
     'speech_score', 'phoneme_accuracy', 'phoneme_error_class',
     'response_latency_ms_phase2', 'echolalia_flag', 'response_latency_ms_phase3',
     'first_tap_correct', 'selection_change_count', 'prompt_count', 'difficulty',
-    'category', 'label', 'synthetic',
+    'category', 'verbal_path', 'label', 'synthetic',
 ]
 
 
