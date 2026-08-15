@@ -47,6 +47,17 @@ Flagging each one explicitly rather than silently picking a default:
    pre-migration missingness in greetings/magic_words rows — a non-abilities
    row with an unexplained null triggers a visible warning rather than being
    silently folded into the same sentinel bucket.
+6. `phoneme_error_class` is NULL in real data whenever RC1 found no error to
+   classify (exact/keyword match short-circuits before RC1 ever runs, an
+   exact phoneme match, or a real deviation the Sinhala L1 taxonomy doesn't
+   cover) or RC1 was unreachable. `generate_synthetic_training_set.py` never
+   writes a raw null for this column — it always writes the literal string
+   'none' when phoneme_accuracy > 0.85. Left as NULL here, this column would
+   one-hot-encode (via get_dummies) to "no category selected" — a code point
+   the model never saw during training, distinct from its learned 'none'
+   category. Substituted with 'none' below to keep the feature in-distribution,
+   mirroring the identical fix already applied in
+   auriva-backend/src/services/trajectoryService.js's buildSession1Features().
 
 Usage:
     python build_trajectory_training_set.py [--since YYYY-MM-DD] [--out PATH]
@@ -234,6 +245,11 @@ def build_dataset(since: str) -> pd.DataFrame:
     if not still_null.empty:
         print(f'WARNING: {len(still_null)} non-abilities row(s) have genuinely '
               f'missing phase1_exposure_ratio (pre-migration) — see R-24/DEC-06.')
+
+    # See docstring item 6: NULL means "no error to classify" (or RC1 unreachable),
+    # never merely missing in a way that should be dropped/warned — the synthetic
+    # generator's own 'none' convention is the correct in-distribution substitute.
+    df['phoneme_error_class'] = df['phoneme_error_class'].fillna('none')
 
     # verbal_path: session-1 Phase 2 baseline attempt's own match_type (same row
     # attempt_number=1 already selects) — True unless that attempt was the
