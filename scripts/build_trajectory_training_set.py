@@ -58,6 +58,16 @@ Flagging each one explicitly rather than silently picking a default:
    category. Substituted with 'none' below to keep the feature in-distribution,
    mirroring the identical fix already applied in
    auriva-backend/src/services/trajectoryService.js's buildSession1Features().
+7. `match_type` is now kept in the output (previously queried internally
+   only to compute `verbal_path`, then discarded). Reason: a null
+   `phoneme_accuracy`/`response_latency_ms_phase2` on a `verbal_path=True`
+   row is ambiguous without it — could be the keyword-match scoring layer
+   (structural, RC1 never even called, not missing data) or a genuine
+   RC1-unreachable fallback (a real gap). `verbal_path` alone collapses
+   both into "verbal," making that distinction impossible to recover after
+   the fact. Keeping `match_type` lets any downstream consumer (Stage 2
+   calibration especially) make that call correctly per-row instead of
+   guessing or dropping indiscriminately.
 
 Usage:
     python build_trajectory_training_set.py [--since YYYY-MM-DD] [--out PATH]
@@ -268,7 +278,7 @@ OUTPUT_COLUMNS = [
     'speech_score', 'phoneme_accuracy', 'phoneme_error_class',
     'response_latency_ms_phase2', 'echolalia_flag', 'response_latency_ms_phase3',
     'first_tap_correct', 'selection_change_count', 'prompt_count', 'difficulty',
-    'category', 'verbal_path', 'label', 'synthetic',
+    'category', 'verbal_path', 'match_type', 'label', 'synthetic',
 ]
 
 
